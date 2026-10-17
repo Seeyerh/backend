@@ -1,0 +1,21 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "fix/issue-177-test-add-integration-tests-for-payment",
+    "fix/issue-178-audit-document-prisma-query-performance",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "fix/issue-177-test-add-integration-tests-for-payment": "main",
+    "fix/issue-178-audit-document-prisma-query-performance": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "fix/issue-177-test-add-integration-tests-for-payment",
+    "fix/issue-178-audit-document-prisma-query-performance",
+    "origin"
+  ]
+}

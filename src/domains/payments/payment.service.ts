@@ -1230,6 +1230,116 @@ export class PaymentService extends BaseService {
   }
 
   /**
+   * Confirm a submitted transaction by polling the Stellar network and
+   * transitioning the tip to its terminal state.
+   *
+   * This is the synchronous counterpart to `checkTransactionConfirmation`
+   * (which only enqueues an async job). It is invoked by the confirmation
+   * worker and by integration tests that exercise the full confirmation
+   * workflow without a live Redis queue.
+   *
+   * Retry strategy (mirrors the queue's `attempts`/`backoff` config):
+   *  - The worker polls up to `maxAttempts` times with exponential backoff.
+   *  - A transaction that is still pending after the retry limit is left in
+   *    PENDING (the worker gives up; a later sweep may re-enqueue it).
+   *  - Transient network errors during polling are retried; a persistent
+   *    error surfaces as `ServiceUnavailableError` so the job can be retried.
+   *  - Confirmation is idempotent: re-running it against an already-completed
+   *    tip is a no-op (no duplicate earnings, no duplicate webhook).
+   */
+  async confirmTransaction(
+    tipId: string,
+    options: {
+      maxAttempts?: number;
+      baseDelayMs?: number;
+      poll?: (transactionHash: string) => Promise<'success' | 'pending' | 'failed'>;
+    } = {}
+  ): Promise<TipResponse> {
+    return this.executeWithLogging('payment.confirmTransaction', async () => {
+      const maxAttempts = options.maxAttempts ?? 3;
+      const baseDelayMs = options.baseDelayMs ?? 10;
+
+      const tip = await this.prisma.tip.findUnique({
+        where: { id: tipId },
+        select: { id: true, status: true, transactionHash: true },
+      });
+
+      if (!tip) {
+        throw new NotFoundError('Tip');
+      }
+
+      if (!tip.transactionHash) {
+        throw new ValidationError('No transaction hash found for this tip');
+      }
+
+      // Idempotency: a tip that already reached a terminal state is not
+      // re-confirmed. Returning the current record keeps retries safe.
+      if (tip.status === TipStatus.COMPLETED || tip.status === TipStatus.FAILED || tip.status === TipStatus.CANCELLED) {
+        logger.info(
+          { tipId, status: tip.status },
+          'Confirmation skipped: tip already in terminal state'
+        );
+        return this.getTip(tipId);
+      }
+
+      const poll =
+        options.poll ??
+        (async (transactionHash: string) => {
+          const { getTransactionStatus } = await import('../../lib/stellar/transactions');
+          return getTransactionStatus(transactionHash);
+        });
+
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        let outcome: 'success' | 'pending' | 'failed';
+        try {
+          outcome = await poll(tip.transactionHash);
+        } catch (error) {
+          lastError = error;
+          logger.warn(
+            { tipId, attempt, maxAttempts, cause: (error as Error).message },
+            'Stellar confirmation poll failed; retrying'
+          );
+          if (attempt < maxAttempts) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, baseDelayMs * Math.pow(2, attempt - 1))
+            );
+            continue;
+          }
+          throw new ServiceUnavailableError(
+            'Unable to confirm transaction on the Stellar network',
+            { tipId, attempts: attempt }
+          );
+        }
+
+        if (outcome === 'success') {
+          return this.updateTipStatus(tipId, { status: TipStatus.COMPLETED });
+        }
+
+        if (outcome === 'failed') {
+          return this.updateTipStatus(tipId, { status: TipStatus.FAILED });
+        }
+
+        // Still pending: back off and poll again.
+        if (attempt < maxAttempts) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, baseDelayMs * Math.pow(2, attempt - 1))
+          );
+        }
+      }
+
+      // Pending beyond the retry limit: leave the tip PENDING so a later sweep
+      // can re-enqueue it. Do not mark it FAILED — the transaction may still
+      // land on-chain.
+      logger.warn(
+        { tipId, attempts: maxAttempts, cause: (lastError as Error | undefined)?.message },
+        'Transaction still pending after retry limit; leaving tip in PENDING'
+      );
+      return this.getTip(tipId);
+    });
+  }
+
+  /**
    * Format database tip record to response DTO
    */
   private formatTipResponse(tip: {
@@ -1242,6 +1352,10 @@ export class PaymentService extends BaseService {
     transactionHash?: string | null;
     createdAt: Date;
     updatedAt: Date;
+    media?: any[];
+    assetCode?: string | null;
+    assetIssuer?: string | null;
+    assetDecimals?: number | null;
   }): TipResponse {
     return {
       id: tip.id,

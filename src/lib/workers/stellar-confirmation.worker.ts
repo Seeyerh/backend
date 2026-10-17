@@ -1,4 +1,4 @@
-import { Worker, Job } from 'bullmq';
+import { Worker, Job } from 'Bullmq';
 import { PrismaClient } from '@prisma/client';
 import { bullConnection, backoffStrategy, moveToDeadLetter, QUEUE_NAMES } from '../queue';
 import { config } from '../../config/env';
