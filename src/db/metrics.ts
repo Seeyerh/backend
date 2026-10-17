@@ -152,3 +152,137 @@ export const prismaUnpaginatedReadsTotal = new Gauge({
   name: 'dorisio_prisma_unbounded_reads',
   help: 'Last observed number of unbounded Prisma list reads per process',
 });
+
+// Cache hit rate gauge (0-1) derived from Prisma cache hits/misses
+export const prismaCacheHitRateGauge = new Gauge({
+  name: 'dorisio_prisma_cache_hit_rate',
+  help: 'Prisma query result cache hit rate (hits / (hits + misses)), 0-1',
+  labelNames: ['model', 'operation'],
+});
+
+// Update the cache hit rate gauge for a given model.operation label pair.
+// Called from prisma-performance instrumentation after each cache lookup.
+export function updatePrismaCacheHitRate(
+  model: string,
+  operation: string,
+  hits: number,
+  misses: number,
+): void {
+  const total = hits + misses;
+  const rate = total > 0 ? hits / total : 0;
+  prismaCacheHitRateGauge.set({ model, operation }, rate);
+}
+
+// Aggregate cache hit/miss counters used to compute the overall hit rate
+// exposed via the /health endpoint. Kept in-process to avoid scraping the
+// prom-client registry on every health check.
+const cacheHitTotals = new Map<string, { hits: number; misses: number }>();
+
+export function recordPrismaCacheLookup(
+  model: string,
+  operation: string,
+  hit: boolean,
+): void {
+  const key = `${model}.${operation}`;
+  const entry = cacheHitTotals.get(key) ?? { hits: 0, misses: 0 };
+  if (hit) {
+    entry.hits += 1;
+  } else {
+    entry.misses += 1;
+  }
+  cacheHitTotals.set(key, entry);
+  updatePrismaCacheHitRate(model, operation, entry.hits, entry.misses);
+}
+
+// Overall Prisma query cache hit rate (0-1) for /health exposure.
+export function getPrismaCacheHitRate(): number {
+  let hits = 0;
+  let misses = 0;
+  for (const entry of cacheHitTotals.values()) {
+    hits += entry.hits;
+    misses += entry.misses;
+  }
+  const total = hits + misses;
+  return total > 0 ? hits / total : 0;
+}
+
+// Top slowest query patterns observed in this process
+export const prismaTopSlowQueryGauge = new Gauge({
+  name: 'dorisio_prisma_top_slow_query_duration_seconds',
+  help: 'Duration of the slowest observed Prisma query pattern, labelled by model.operation',
+  labelNames: ['model', 'operation', 'rank'],
+});
+
+export const prismaTopSlowQueryCountGauge = new Gauge({
+  name: 'dorisio_prisma_top_slow_query_count',
+  help: 'Number of slow occurrences for the top slowest Prisma query patterns',
+  labelNames: ['model', 'operation', 'rank'],
+});
+
+// In-process tracker for the top N slowest query patterns.
+// Keyed by "model.operation" -> { maxDurationSeconds, slowCount }.
+const TOP_SLOW_QUERY_LIMIT = 3;
+const topSlowQueryPatterns = new Map<
+  string,
+  { model: string; operation: string; maxDurationSeconds: number; slowCount: number }
+>();
+
+// Record a slow query occurrence and refresh the top-N gauges.
+// Called from prisma-performance instrumentation whenever a query exceeds the
+// slow query threshold.
+export function recordPrismaSlowQuery(
+  model: string,
+  operation: string,
+  durationSeconds: number,
+): void {
+  const key = `${model}.${operation}`;
+  const existing = topSlowQueryPatterns.get(key);
+  if (existing) {
+    existing.slowCount += 1;
+    if (durationSeconds > existing.maxDurationSeconds) {
+      existing.maxDurationSeconds = durationSeconds;
+    }
+  } else {
+    topSlowQueryPatterns.set(key, {
+      model,
+      operation,
+      maxDurationSeconds: durationSeconds,
+      slowCount: 1,
+    });
+  }
+  refreshTopSlowQueryGauges();
+}
+
+function refreshTopSlowQueryGauges(): void {
+  const ranked = Array.from(topSlowQueryPatterns.values())
+    .sort((a, b) => b.maxDurationSeconds - a.maxDurationSeconds)
+    .slice(0, TOP_SLOW_QUERY_LIMIT);
+
+  // Reset previous label combinations so stale ranks do not linger.
+  prismaTopSlowQueryGauge.reset();
+  prismaTopSlowQueryCountGauge.reset();
+
+  ranked.forEach((entry, index) => {
+    const rank = String(index + 1);
+    prismaTopSlowQueryGauge.set(
+      { model: entry.model, operation: entry.operation, rank },
+      entry.maxDurationSeconds,
+    );
+    prismaTopSlowQueryCountGauge.set(
+      { model: entry.model, operation: entry.operation, rank },
+      entry.slowCount,
+    );
+  });
+}
+
+// Snapshot of the top slow query patterns for exposure via /health.
+export function getTopSlowQueryPatterns(): Array<{
+  model: string;
+  operation: string;
+  maxDurationSeconds: number;
+  slowCount: number;
+}> {
+  return Array.from(topSlowQueryPatterns.values())
+    .sort((a, b) => b.maxDurationSeconds - a.maxDurationSeconds)
+    .slice(0, TOP_SLOW_QUERY_LIMIT);
+}

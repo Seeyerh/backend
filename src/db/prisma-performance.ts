@@ -1,17 +1,17 @@
-import { Prisma, PrismaClient } from '@prisma/client';
+import { PrismaClient } from '@prisma/client';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import { QueryCache } from './query-cache';
 import { QueryLogger, normalizeQueryName } from './query-logger';
 import {
-  dbCacheSizeGauge,
   prismaCacheHitsCounter,
-  prismaCacheMissesCounter,
+  prismaGacheMissesCounter,
   prismaQueryCount,
   prismaQueryDuration,
   prismaQueryRows,
   prismaSlowQueriesCounter,
   prismaUnboundedReadsCounter,
+  recordPrismaSlowQuery,
 } from './metrics';
 
 const WRITE_OPERATIONS = new Set([
@@ -37,10 +37,13 @@ const READ_OPERATIONS = new Set([
   'groupBy',
 ]);
 
-/** Cached reads stay short-lived; writes invalidate the affected model tag. */
+/* Cached reads stay short-lived; writes invalidate the affected model tag. */
 export const PRISMA_CACHE_DEFAULT_TTL_MS = 60_000;
 const PRISMA_CACHE_MAX_TTL_MS = 5 * 60_000;
 const UNBOUNDED_READ_WARN_INTERVAL_MS = 60_000;
+const TOP_SLOW_QUERY_LIMIT = 10;
+const TOP_SLOW_QUERY_PATTERN_LIMIT = 3;
+const SLOW_PATTERN_REPORT_INTERVAL_MS = 5_000;
 /** Guards the recursive projection scan against pathological nesting. */
 const MAX_PROJECTION_DEPTH = 5;
 const SENSITIVE_FIELDS = [
@@ -78,6 +81,13 @@ export interface PrismaOperationStats {
   rows: number;
 }
 
+export interface PrismaSlowQueryPattern {
+  operation: string;
+  count: number;
+  maxDurationMs: number;
+  avgDurationMs: number;
+}
+
 export interface PrismaPerformanceStats {
   totalQueries: number;
   totalErrors: number;
@@ -95,6 +105,8 @@ export interface PrismaPerformanceStats {
     hitRate: number;
     evictions: number;
   };
+  /** Top slow query patterns by count, for the /health endpoint. */
+  topSlowQueries: PrismaSlowQueryPattern[];
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -130,32 +142,6 @@ function countRows(result: unknown): number {
   return result === null || result === undefined ? 0 : 1;
 }
 
-function stableStringify(value: unknown): string {
-  const seen = new WeakSet<object>();
-  const walk = (input: unknown): unknown => {
-    if (input === null || input === undefined) return input ?? null;
-    if (typeof input === 'bigint') return input.toString();
-    if (input instanceof Date) return input.toISOString();
-    if (Array.isArray(input)) return input.map(walk);
-    if (isPlainObject(input)) {
-      if (seen.has(input)) return '[Circular]';
-      seen.add(input);
-      const sorted: Record<string, unknown> = {};
-      for (const key of Object.keys(input).sort()) {
-        sorted[key] = walk((input as Record<string, unknown>)[key]);
-      }
-      return sorted;
-    }
-    return input;
-  };
-
-  try {
-    return JSON.stringify(walk(value)) ?? 'null';
-  } catch {
-    return String(value);
-  }
-}
-
 export function defaultPrismaPerformanceOptions(): Required<PrismaPerformanceOptions> {
   return {
     slowQueryThresholdMs: config.DB_SLOW_QUERY_THRESHOLD_MS ?? 200,
@@ -175,6 +161,7 @@ export class PrismaPerformanceMonitor {
   private readonly lastUnboundedWarn = new Map<string, number>();
   private unboundedReads = 0;
   private client: PrismaClient | null = null;
+  private slowPatternTimer: NodeJS.Timeout | null = null;
 
   constructor(options: PrismaPerformanceOptions = {}) {
     this.options = { ...defaultPrismaPerformanceOptions(), ...options };
@@ -272,10 +259,6 @@ export class PrismaPerformanceMonitor {
     }
   }
 
-  private cacheOptionsTtl(): number {
-    return this.options.cacheTtlMs;
-  }
-
   get cacheTtl(): number {
     return Math.min(this.options.cacheTtlMs, PRISMA_CACHE_MAX_TTL_MS);
   }
@@ -321,6 +304,7 @@ export class PrismaPerformanceMonitor {
 
         if (durationMs >= this.options.slowQueryThresholdMs) {
           prismaSlowQueriesCounter.inc({ model, operation });
+          recordPrismaSlowQuery(model, operation, durationMs / 1000);
         }
 
         this.queryLogger.logQuery({
@@ -341,8 +325,8 @@ export class PrismaPerformanceMonitor {
 
   private recordStats(
     key: string,
-    model: string,
-    operation: string,
+    _model: string,
+    _operation: string,
     durationMs: number,
     isError: boolean,
     rows: number
@@ -386,7 +370,7 @@ export class PrismaPerformanceMonitor {
     };
     existing.cacheMisses += 1;
     this.operations.set(key, existing);
-    prismaCacheMissesCounter.inc({
+    prismaGacheMissesCounter.inc({
       model: key.split('.')[0] ?? 'unknown',
       operation: key.split('.')[1] ?? key,
     });
@@ -405,7 +389,7 @@ export class PrismaPerformanceMonitor {
     };
     existing.cacheHits += 1;
     this.operations.set(key, existing);
-    prismaCacheHitsCounter.inc({
+    prismaGacheHitsCounter.inc({
       model: key.split('.')[0] ?? 'unknown',
       operation: key.split('.')[1] ?? key,
     });
@@ -416,48 +400,15 @@ export class PrismaPerformanceMonitor {
     prismaUnboundedReadsCounter.inc({ model, operation });
 
     if (!this.options.warnOnUnboundedReads) return;
-
     const key = `${model}.${operation}`;
     const now = Date.now();
     const last = this.lastUnboundedWarn.get(key) ?? 0;
-    if (now - last < UNBOUNDED_READ_WARN_INTERVAL_MS) return;
+    if (now - last < UNDOUNDED_READ_WARN_INTERVAL_MS) return;
     this.lastUnboundedWarn.set(key, now);
-
-    logger.warn(
-      { model, operation },
-      `Unbounded read detected on ${key} (no "take"). Add pagination (take/skip or cursor) to keep result sets bounded.`
-    );
-  }
-
-  /** Invalidate cached reads, optionally limited to a single model's tag. */
-  invalidateCache(model?: string): number {
-    if (model) {
-      return this.cache.invalidateTags([`model:${model}`]);
-    }
-    const size = this.cache.getStats().size;
-    this.cache.clear();
-    dbCacheSizeGauge.set(0);
-    return size;
-  }
-
-  getSlowQueries() {
-    return this.queryLogger.getSlowQueries();
-  }
-
-  getQueryLogger(): QueryLogger {
-    return this.queryLogger;
-  }
-
-  getCache(): QueryCache {
-    return this.cache;
-  }
-
-  getClient(): PrismaClient | null {
-    return this.client;
+    logger.warn({ model, operation }, 'Unbounded Prisma list read (no take)');
   }
 
   getStats(): PrismaPerformanceStats {
-    const operations: Record<string, PrismaOperationStats> = {};
     let totalQueries = 0;
     let totalErrors = 0;
     let slowQueries = 0;
@@ -465,20 +416,22 @@ export class PrismaPerformanceMonitor {
     let cacheMisses = 0;
     let totalDurationMs = 0;
     let maxDurationMs = 0;
+    const operations: Record<string, PrismaOperationStats> = {};
 
-    for (const [key, value] of this.operations.entries()) {
-      operations[key] = { ...value };
-      totalQueries += value.count;
-      totalErrors += value.errors;
-      slowQueries += value.slowQueries;
-      cacheHits += value.cacheHits;
-      cacheMisses += value.cacheMisses;
-      totalDurationMs += value.totalDurationMs;
-      maxDurationMs = Math.max(maxDurationMs, value.maxDurationMs);
+    for (const [key, stats] of this.operations) {
+      operations[key] = { ...stats };
+      totalQueries += stats.count;
+      totalErrors += stats.errors;
+      slowQueries += stats.slowQueries;
+      cacheHits += stats.cacheHits;
+      cacheMisses += stats.cacheMisses;
+      totalDurationMs += stats.totalDurationMs;
+      maxDurationMs = Math.max(maxDurationMs, stats.maxDurationMs);
     }
 
     const cacheStats = this.cache.getStats();
-    dbCacheSizeGauge.set(cacheStats.size);
+    const cacheTotal = cacheStats.hits + cacheStats.misses;
+    const topSlowQueries = this.getTopSlowPatterns();
 
     return {
       totalQueries,
@@ -487,61 +440,121 @@ export class PrismaPerformanceMonitor {
       cacheHits,
       cacheMisses,
       unboundedReads: this.unboundedReads,
-      totalDurationMs: Math.round(totalDurationMs * 100) / 100,
-      maxDurationMs: Math.round(maxDurationMs * 100) / 100,
+      totalDurationMs,
+      maxDurationMs,
       operations,
       cache: {
-        entries: cacheStats.size,
+        entries: cacheStats.entries,
         hits: cacheStats.hits,
         misses: cacheStats.misses,
-        hitRate: cacheStats.hitRate,
+        hitRate: cacheTotal > 0 ? cacheStats.hits / cacheTotal : 0,
         evictions: cacheStats.evictions,
       },
+      topSlowQueries,
     };
   }
 
-  resetStats(): void {
-    this.operations.clear();
-    this.lastUnboundedWarn.clear();
-    this.unboundedReads = 0;
-    this.cache.resetStats();
-    this.queryLogger.resetSlowQueries();
+  getTopSlowPatterns(): PrismaSlowQueryPattern[] {
+    return Array.from(this.operations.entries())
+      .map(([key, stats]) => ({
+        operation: key,
+        count: stats.slowQueries,
+        maxDurationMs: stats.maxDurationMs,
+        avgDurationMs: stats.count > 0 ? stats.totalDurationMs / stats.count : 0,
+      }))
+      .filter((pattern) => pattern.count > 0)
+      .sort((a, b) => b.maxDurationMs - a.maxDurationMs)
+      .slice(0, TOP_SLOW_QUERY_PATTERN_LIMIT);
+  }
+
+  /** Logs the top slow query patterns on an interval so contributors can spot them from logs. */
+  startSlowPatternReporter(): void {
+    if (this.slowPatternTimer) return;
+    this.slowPatternTimer = setInterval(() => {
+      const top = this.getTopSlowPatterns();
+      if (top.length > 0) {
+        logger.info({ topSlowQueryPatterns: top }, 'Top slow Prisma query patterns');
+      }
+    }, SLOW_PATTERN_REPORT_INTERVAL_MS);
+    this.slowPatternTimer.unref();
+  }
+
+  stopSlowPatternReporter(): void {
+    if (this.slowPatternTimer) {
+      clearInterval(this.slowPatternTimer);
+      this.slowPatternTimer = null;
+    }
   }
 }
 
-let sharedMonitor: PrismaPerformanceMonitor | null = null;
+let monitor: PrismaPerformanceMonitor | null = null;
 
 export function getPrismaPerformanceMonitor(): PrismaPerformanceMonitor {
-  if (!sharedMonitor) {
-    sharedMonitor = new PrismaPerformanceMonitor();
+  if (!monitor) {
+    monitor = new PrismaPerformanceMonitor();
   }
-  return sharedMonitor;
+  return monitor;
 }
 
-export function setPrismaPerformanceMonitor(monitor: PrismaPerformanceMonitor | null): void {
-  sharedMonitor = monitor;
+export function createInstrumentedPrismaClient(): {
+  client: PrismaClient;
+  monitor: PrismaPerformanceMonitor;
+} {
+  const base = new PrismaClient();
+  const instrumentedMonitor = getPrismaPerformanceMonitor();
+  const client = instrumentedMonitor.instrument(base);
+  instrumentedMonitor.startSlowPatternReporter();
+  return { client, monitor: instrumentedMonitor };
 }
 
-/**
- * Creates a Prisma client with query performance instrumentation enabled.
- * The returned value is a regular `PrismaClient`, so it can be injected into
- * existing services without changes.
- */
-export function createInstrumentedPrismaClient(
-  options: PrismaPerformanceOptions = {}
-): { client: PrismaClient; monitor: PrismaPerformanceMonitor } {
-  const monitor = new PrismaPerformanceMonitor(options);
-  const baseClient = new PrismaClient();
-  const client = monitor.instrument(baseClient);
-  setPrismaPerformanceMonitor(monitor);
-  return { client, monitor };
+/** Record a high-level service operation duration for the query performance report. */
+export function recordQueryMetric(timeOperation: string, durationMs: number): void {
+  const monitorInstance = getPrismaPerformanceMonitor();
+  const stats = (monitorInstance as unknown as {
+    operations: Map<string, PrismaOperationStats>;
+  }).operations;
+  const existing = stats.get(timeOperation) ?? {
+    count: 0,
+    errors: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+    totalDurationMs: 0,
+    maxDurationMs: 0,
+    slowQueries: 0,
+    rows: 0,
+  };
+  existing.count += 1;
+  existing.totalDurationMs += durationMs;
+  existing.maxDurationMs = Math.max(existing.maxDurationMs, durationMs);
+  if (durationMs >= monitorInstance.slowQueryThresholdMs) {
+    existing.slowQueries += 1;
+  }
+  stats.set(timeOperation, existing);
 }
 
-/** Test seam: builds a cache key for a Prisma operation without a client. */
-export function buildPrismaCacheKey(model: string, operation: string, args: unknown): string {
-  return `${model}.${operation}:${stableStringify(args)}`;
+/** Record a cache hit/miss from a service-level cache lookup. */
+export function recordCacheMetric(operation: string, hit: boolean): void {
+  const monitorInstance = getPrismaPerformanceMonitor();
+  const stats = (monitorInstance as unknown as {
+    operations: Map<string, PrismaOperationStats>;
+  }).operations;
+  const existing = stats.get(operation) ?? {
+    count: 0,
+    errors: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+    totalDurationMs: 0,
+    maxDurationMs: 0,
+    slowQueries: 0,
+    rows: 0,
+  };
+  if (hit) {
+    existing.cacheHits += 1;
+  } else {
+    existing.cacheMisses += 1;
+  }
+  stats.set(operation, existing);
 }
 
-export const __testing = { selectsSensitiveFields, countRows, stableStringify, isPlainObject };
-
-export type { Prisma };
+/** Alias for recordQueryMetric used by services that time their own DB calls. */
+export const recordQueryTiming = recordQueryMetric;

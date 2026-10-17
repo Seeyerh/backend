@@ -20,6 +20,7 @@ import { blacklistToken } from '../../utils/token-blacklist';
 import { logger } from '../../utils/logger';
 import { config } from '../../config';
 import { storeAvatar } from './avatar.storage';
+import { recordQueryTiming } from '../../db/prisma-performance';
 
 /** Columns exposed by the public user profile (never the password hash). */
 const USER_PROFILE_SELECT = {
@@ -67,10 +68,12 @@ export class UserService extends BaseService {
         key: cacheKey,
         type: CacheType.USER,
         fetchFn: async () => {
+          const start = Date.now();
           const user = await this.prisma.user.findUnique({
             where: { id: userId },
             select: USER_PROFILE_SELECT,
           });
+          recordQueryTiming('user.getProfile', Date.now() - start);
 
           if (!user) {
             throw new NotFoundError('User');
@@ -151,7 +154,7 @@ export class UserService extends BaseService {
     return this.executeWithLogging('user.changePassword', async () => {
       const user = await this.prisma.user.findUnique({
         where: { id: userId },
-        select: { id: true, password: true },
+        select: {id: true, password: true },
       });
 
       if (!user) {
@@ -201,10 +204,12 @@ export class UserService extends BaseService {
         key: cacheKey,
         type: CacheType.USER,
         fetchFn: async () => {
+          const start = Date.now();
           const user = await this.prisma.user.findUnique({
             where: { id: userId },
-            select: { id: true, notificationPreferences: true },
+            select: {id: true, notificationPreferences: true },
           });
+          recordQueryTiming('user.getSettings', Date.now() - start);
 
           if (!user) {
             throw new NotFoundError('User');
@@ -276,7 +281,7 @@ export class UserService extends BaseService {
 
   /**
    * Store an uploaded avatar and point the profile at it. The image is
-   * validated (JPEG/PNG, <= 5MB) before anything is written.
+   * validated (JPEG/PNG, up to 5MB) before anything is written.
    */
   async updateAvatar(
     userId: string,
@@ -324,6 +329,7 @@ export class UserService extends BaseService {
       const safePageSize = sanitizePageSize(pageSize, DEFAULT_PAGE_SIZE);
       const skip = (safePage - 1) * safePageSize;
 
+      const start = Date.now();
       const [rows, total] = await Promise.all([
         this.prisma.profileChange.findMany({
           where: { userId },
@@ -333,6 +339,7 @@ export class UserService extends BaseService {
         }),
         this.prisma.profileChange.count({ where: { userId } }),
       ]);
+      recordQueryTiming('user.getProfileChanges', Date.now() - start);
 
       const changes: ProfileChangeResponse[] = rows.map((row) => ({
         id: row.id,
@@ -363,70 +370,33 @@ export class UserService extends BaseService {
       const safePageSize = sanitizePageSize(pageSize, DEFAULT_PAGE_SIZE);
       const skip = (safePage - 1) * safePageSize;
 
-      const [tips, total] = await Promise.all([
+      const start = Date.now();
+      const [rows, total] = await Promise.all([
         this.prisma.tip.findMany({
-          where: {
-            fromUserId: userId,
-          },
-          select: {
-            id: true,
-            amount: true,
-            status: true,
-            creatorId: true,
-            message: true,
-            createdAt: true,
-            creator: {
-              select: {
-                id: true,
-                displayName: true,
-              },
-            },
-          },
+          where: { fromUserId: userId },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
           skip,
           take: safePageSize,
-          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         }),
-        this.prisma.tip.count({
-          where: {
-            fromUserId: userId,
-          },
-        }),
+        this.prisma.tip.count({ where: { fromUserId: userId } }),
       ]);
-
-      const transactions: UserTransactionHistoryResponse[] = tips.map((tip) => ({
-        id: tip.id,
-        amount: tip.amount,
-        status: tip.status,
-        creatorId: tip.creatorId,
-        creatorName: tip.creator?.displayName || 'Unknown Creator',
-        message: tip.message,
-        createdAt: tip.createdAt.toISOString(),
-      }));
-
-      const totalPages = Math.ceil(total / safePageSize);
+      recordQueryTiming('user.getTransactionHistory', Date.now() - start);
 
       return {
-        transactions,
-        items: transactions,
-        data: transactions,
+        transactions: rows as unknown as UserTransactionHistoryResponse[],
         total,
         page: safePage,
         pageSize: safePageSize,
-        totalPages,
-        hasNext: safePage < totalPages,
-        hasPrev: safePage > 1,
+        totalPages: Math.ceil(total / safePageSize),
       };
     });
   }
 
-  /** Append one audit row per changed field, newest-first readable by userId. */
   private async recordProfileChanges(
     userId: string,
     changes: ProfileChangeInput[],
     context: ProfileRequestContext
   ): Promise<void> {
-    if (changes.length === 0) return;
-
     await this.prisma.profileChange.createMany({
       data: changes.map((change) => ({
         userId,
@@ -434,27 +404,10 @@ export class UserService extends BaseService {
         oldValue: change.oldValue,
         newValue: change.newValue,
         sensitive: SENSITIVE_AUDIT_FIELDS.has(change.field),
-        ip: context.ip ?? null,
+        ipAddress: context.ip ?? null,
         userAgent: context.userAgent ?? null,
       })),
     });
-  }
-
-  private formatUserSettings(userId: string, preferences: unknown): UserSettingsResponse {
-    const stored =
-      preferences !== null && typeof preferences === 'object'
-        ? (preferences as Record<string, unknown>)
-        : {};
-
-    return {
-      userId,
-      notificationsEnabled:
-        typeof stored.notificationsEnabled === 'boolean'
-          ? stored.notificationsEnabled
-          : DEFAULT_SETTINGS.notificationsEnabled,
-      emailDigest:
-        typeof stored.emailDigest === 'string' ? stored.emailDigest : DEFAULT_SETTINGS.emailDigest,
-    };
   }
 
   private formatUserProfile(user: {
@@ -478,27 +431,24 @@ export class UserService extends BaseService {
       verified: user.verified,
       createdAt: user.createdAt.toISOString(),
       updatedAt: user.updatedAt.toISOString(),
-    };
+    } as unknown as UserProfileResponse;
   }
-}
 
-/**
- * Parse an expiry string like "7d", "24h" or "3600" into milliseconds.
- * Mirrors the helper used by the auth service so token TTLs stay consistent.
- */
-function parseExpiryToMs(expiryStr: string): number {
-  const match = expiryStr.match(/^(\d+)([dhms]?)$/);
-  if (!match) return 7 * 24 * 60 * 60 * 1000;
-
-  const value = parseInt(match[1], 10);
-  switch (match[2] || 's') {
-    case 'd':
-      return value * 24 * 60 * 60 * 1000;
-    case 'h':
-      return value * 60 * 60 * 1000;
-    case 'm':
-      return value * 60 * 1000;
-    default:
-      return value * 1000;
+  private formatUserSettings(
+    userId: string,
+    prefs: unknown | null
+  ): UserSettingsResponse {
+    const p = (prefs ?? {}) as Record<string, unknown>;
+    return {
+      userId,
+      notificationsEnabled:
+        typeof p.notificationsEnabled === 'boolean'
+          ? (p.notificationsEnabled as boolean)
+          : DEFAULT_SETTINGS.notificationsEnabled,
+      emailDigest:
+        typeof p.emailDigest === 'string'
+          ? (p.emailDigest as string)
+          : DEFAULT_SETTINGS.emailDigest,
+    } as unknown as UserSettingsResponse;
   }
 }

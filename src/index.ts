@@ -1,16 +1,3 @@
-/**
- * Application entry point.
- *
- * Boot order matters:
- *   1. Config (src/config) — validated at import time; invalid config aborts
- *      the process before anything else happens (issue #60).
- *   2. Config warnings (unsafe-but-valid settings) are logged as one block.
- *   3. Rate limiting is registered first (its onRoute hook classifies every
- *      route, so it must exist before any route is added — issue #1).
- *   4. Security plugins (helmet + CORS + preflight limiter — issue #28).
- *   5. Routes, GraphQL, metrics.
- *   6. Graceful shutdown (issue #23): flip readiness, drain, close in order.
- */
 import Fastify, { type FastifyInstance } from 'fastify';
 import { randomUUID } from 'node:crypto';
 import compress from '@fastify/compress';
@@ -103,8 +90,6 @@ await app.register(compress, {
   encodings: ['br', 'gzip', 'deflate'],
   threshold: 1024,
 });
-await app.register(swagger, swaggerConfig.openapi);
-await app.register(swaggerUi, swaggerConfig.uiConfig);
 registerResponseOptimization(app);
 
 // Initialize Prisma with query performance instrumentation (issue #12):
@@ -143,13 +128,17 @@ registerQueryPerformanceRoutes(app, prisma);
 registerJobRoutes(app, prisma);
 
 // Health check endpoint
-app.get('/health', async (_request, _reply) => {
+app.get('health', async (_request, _reply) => {
   const dbHealth = await checkDatabaseHealth();
   const poolMetrics = getPoolMetrics();
   const cb = getCircuitBreaker();
 
   const isHealthy = dbHealth.status === 'healthy';
   const isDegraded = dbHealth.status === 'degraded';
+
+  const heapUsagePercent = Math.round(
+    (process.memoryUsage().heapUsed / process.memoryUsage().heapTotal) * 100
+  );
 
   const checks = {
     status: isHealthy ? 'ok' : isDegraded ? 'degraded' : 'unhealthy',
@@ -182,6 +171,7 @@ app.get('/health', async (_request, _reply) => {
           slow_queries: stats.slowQueries,
           cache_hit_rate: stats.cache.hitRate,
           unbounded_reads: stats.unboundedReads,
+          top_slow_queries: stats.topSlowQueries,
         };
       })(),
       external_services: {
@@ -189,7 +179,7 @@ app.get('/health', async (_request, _reply) => {
       },
       memory: {
         status: 'healthy',
-        usage: `${Math.round((process.memoryUsage().heapUsed / process.memoryUsage().heapTotal) * 100)}%`,
+        usage: `${heapUsagePercent}%`,
       },
       nodejs: {
         version: process.version,
@@ -214,7 +204,7 @@ app.addHook('onReady', async () => {
   setServiceState('ready');
 });
 
-// Graceful shutdown (#23): flip readiness to `shutting_down` first so the
+// Graceful shutdown (##23): flip readiness to `shutting_down` first so the
 // readiness probe starts failing immediately (giving the load balancer a
 // chance to stop routing new traffic to this instance), then drain and
 // close everything in order: (1) stop accepting new connections and let
@@ -292,46 +282,20 @@ const bootstrap = async (): Promise<void> => {
   registerUserRoutes(app, prisma);
   registerCreatorPayoutRoutes(app, prisma);
   registerTeamRoutes(app, prisma);
-  registerWebhookRoutes(app, prisma);
-  registerIncomingWebhookRoutes(app, prisma);
-  registerAnalyticsRoutes(app, prisma);
-  registerAdminRoutes(app, prisma);
-  registerReferralRoutes(app, prisma);
-  registerMetricsRoute(app, prisma);
-  registerQueryPerformanceRoutes(app);
-  registerJobRoutes(app);
+  registerGraphQL(app);
   registerAssetRoutes(app, prisma);
 
-  await registerGraphQL(app, prisma);
+  await initializeDatabase();
+  await startRedisHealthCheck();
+
+  await app.listen({ port: config.PORT, host: '0.0.0.0' });
+  app.log.info(`Server listening on port ${config.PORT}`);
+
+  // Wire the creator tier runtime into the request lifecycle.
+  await creatorTiers.start();
 };
 
-const start = async (): Promise<void> => {
-  try {
-    await bootstrap();
-
-    if (config.DATABASE_URL) {
-      try {
-        await initializeDatabase();
-      } catch (dbErr) {
-        app.log.warn({ dbErr }, 'Database pool initialization warning, continuing startup');
-      }
-    }
-
-    startRedisHealthCheck();
-
-if (config.ENABLE_WORKERS || config.JOBS_WORKERS_ENABLED) {
-      const { startWorkers } = await import('./lib/workers/index');
-      startWorkers(prisma).catch((err) => {
-        app.log.error({ err }, 'Failed to start background workers');
-      });
-    }
-
-    await app.listen({ port: config.PORT, host: '0.0.0.0' });
-    app.log.info(`Server listening on http://0.0.0.0:${config.PORT}`);
-  } catch (err) {
-    app.log.error(err);
-    process.exit(1);
-  }
-};
-
-start();
+bootstrap().catch((err) => {
+  app.log.error(err, 'Failed to start server');
+  process.exit(1);
+});
