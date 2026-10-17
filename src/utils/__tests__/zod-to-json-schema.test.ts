@@ -69,6 +69,22 @@ describe('zodToJsonSchema', () => {
     });
   });
 
+  it('carries describe() text over as a description', () => {
+    const schema = z.object({
+      memo: z
+        .string()
+        .refine((value) => Buffer.byteLength(value, 'utf8') <= 28)
+        .describe('At most 28 bytes when encoded as UTF-8')
+        .optional(),
+    });
+
+    const json = zodToJsonSchema(schema) as { properties: Record<string, Record<string, unknown>> };
+    expect(json.properties.memo).toEqual({
+      type: 'string',
+      description: 'At most 28 bytes when encoded as UTF-8',
+    });
+  });
+
   it('unwraps defaults, optionals and transforms', () => {
     const schema = z.object({
       currency: z.enum(['USD', 'XLM']).default('USD'),

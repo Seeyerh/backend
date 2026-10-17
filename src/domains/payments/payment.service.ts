@@ -1022,9 +1022,22 @@ export class PaymentService extends BaseService {
     creatorPublicKey: string,
     amount: string,
     assetCode?: string,
-    assetIssuer?: string
+    assetIssuer?: string,
+    memo?: string
   ): Promise<BuildTransactionResponse> {
     return this.executeWithLogging('payment.buildTransaction', async () => {
+      // Stellar text memos are capped at MEMO_MAX_LENGTH UTF-8 bytes (#180). The
+      // route already answers 400 for an oversized memo; the check is repeated
+      // here so callers that bypass the route layer also fail before any
+      // database or network call. Without a caller memo the tip id is used.
+      const transactionMemo = memo ?? buildTipMemo(tipId);
+      const memoCheck = validateMemo(transactionMemo);
+      if (!memoCheck.valid) {
+        throw new ValidationError(memoCheck.reason || 'Invalid transaction memo', {
+          field: 'memo',
+        });
+      }
+
       const tip = await this.prisma.tip.findUnique({
         where: { id: tipId },
         select: { id: true, fromUserId: true, status: true },
@@ -1051,14 +1064,6 @@ export class PaymentService extends BaseService {
         throw new UnauthorizedError('Wallet does not match tip sender');
       }
 
-      // Stellar memos are capped at 28 bytes. Build (and verify) the memo before
-      // touching the network so we fail fast with a clear error.
-      const memo = buildTipMemo(tipId);
-      const memoCheck = validateMemo(memo);
-      if (!memoCheck.valid) {
-        throw new ValidationError(memoCheck.reason || 'Invalid transaction memo');
-      }
-
       try {
         // Build transaction
         const transactionBuilder = await buildPaymentTransaction({
@@ -1067,7 +1072,7 @@ export class PaymentService extends BaseService {
           amount,
           assetCode,
           assetIssuer,
-          memo,
+          memo: transactionMemo,
         });
 
         const transaction = transactionBuilder;

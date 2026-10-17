@@ -25,6 +25,7 @@ interface ZodDef {
   minLength?: { value: number };
   maxLength?: { value: number };
   unknownKeys?: string;
+  description?: string;
 }
 
 function getDef(schema: unknown): ZodDef | undefined {
@@ -139,6 +140,17 @@ export function zodToJsonSchema(schema: unknown): JsonSchema {
   const def = getDef(schema);
   if (!def) return {};
 
+  const converted = convertDef(def, schema);
+
+  // `.describe()` text documents rules JSON Schema cannot express (for example
+  // a byte limit), so it is carried over to the generated schema.
+  if (typeof def.description === 'string' && converted.description === undefined) {
+    return { ...converted, description: def.description };
+  }
+  return converted;
+}
+
+function convertDef(def: ZodDef, schema: unknown): JsonSchema {
   switch (def.typeName) {
     case 'ZodString':
       return convertString(def);

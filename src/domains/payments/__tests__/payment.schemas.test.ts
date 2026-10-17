@@ -1,15 +1,28 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import Fastify from 'fastify';
 import { Keypair } from '@stellar/stellar-sdk';
 import {
   BuildPaymentTransactionSchema,
   CreateTipSchema,
+  MemoSchema,
   SubmitPaymentTransactionSchema,
   TipHistoryQuerySchema,
   buildPaymentTransactionJsonSchema,
   createTipJsonSchema,
 } from '../payment.schemas';
+import { MEMO_MAX_LENGTH } from '../../../lib/stellar/validation';
+import { validateRequest } from '../../../middleware/validation';
+import { AppError } from '../../../utils/errors';
 
 const validPublicKey = Keypair.random().publicKey();
+
+/** A valid transaction build body, with an optional memo. */
+const buildBody = (memo?: string) => ({
+  senderPublicKey: validPublicKey,
+  creatorPublicKey: validPublicKey,
+  amount: '10',
+  ...(memo === undefined ? {} : { memo }),
+});
 
 describe('CreateTipSchema', () => {
   it('accepts a valid tip and applies defaults', () => {
@@ -97,6 +110,89 @@ describe('BuildPaymentTransactionSchema', () => {
   });
 });
 
+describe('MemoSchema (#180)', () => {
+  it('leaves the memo optional', () => {
+    const result = BuildPaymentTransactionSchema.safeParse(buildBody());
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.memo).toBeUndefined();
+    }
+  });
+
+  it('accepts a memo of exactly 28 bytes', () => {
+    const memo = 'a'.repeat(MEMO_MAX_LENGTH);
+    const result = BuildPaymentTransactionSchema.safeParse(buildBody(memo));
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.memo).toBe(memo);
+    }
+  });
+
+  it('rejects a memo of 29 bytes with a field error naming the byte limit', () => {
+    const result = BuildPaymentTransactionSchema.safeParse(
+      buildBody('a'.repeat(MEMO_MAX_LENGTH + 1))
+    );
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const issue = result.error.issues.find((entry) => entry.path.join('.') === 'memo');
+      expect(issue?.message).toContain(`${MEMO_MAX_LENGTH} UTF-8 bytes`);
+    }
+  });
+
+  it('counts UTF-8 bytes, not characters', () => {
+    // 15 two byte characters fit in 28 characters but need 30 bytes.
+    const twoByteChars = 'é'.repeat(15);
+    expect(twoByteChars.length).toBeLessThanOrEqual(MEMO_MAX_LENGTH);
+    expect(MemoSchema.safeParse(twoByteChars).success).toBe(false);
+
+    // Seven four byte characters are exactly 28 bytes; eight are not.
+    expect(MemoSchema.safeParse('\u{1F600}'.repeat(7)).success).toBe(true);
+    expect(MemoSchema.safeParse('\u{1F600}'.repeat(8)).success).toBe(false);
+  });
+
+  it('rejects an empty memo', () => {
+    expect(MemoSchema.safeParse('').success).toBe(false);
+    expect(MemoSchema.safeParse('   ').success).toBe(false);
+  });
+
+  it('answers 400 with a field error before the route handler runs', async () => {
+    const app = Fastify({ logger: false });
+    const handler = vi.fn(async () => ({ built: true }));
+
+    app.setErrorHandler((error, _request, reply) => {
+      if (error instanceof AppError) {
+        reply
+          .code(error.statusCode)
+          .send({ code: error.code, message: error.message, details: error.details });
+        return;
+      }
+      reply.code(500).send({ message: error.message });
+    });
+    app.post(
+      '/build',
+      { preHandler: [validateRequest({ body: BuildPaymentTransactionSchema })] },
+      handler
+    );
+    await app.ready();
+
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/build',
+        payload: buildBody('a'.repeat(MEMO_MAX_LENGTH + 1)),
+      });
+
+      expect(res.statusCode).toBe(400);
+      const body = res.json();
+      expect(body.code).toBe('VALIDATION_ERROR');
+      expect(body.details.fields['body.memo']).toContain(`${MEMO_MAX_LENGTH} UTF-8 bytes`);
+      expect(handler).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+});
+
 describe('SubmitPaymentTransactionSchema', () => {
   it('requires an envelope', () => {
     expect(SubmitPaymentTransactionSchema.safeParse({}).success).toBe(false);
@@ -150,5 +246,15 @@ describe('derived OpenAPI schemas', () => {
     const schema = buildPaymentTransactionJsonSchema as { properties: Record<string, unknown> };
     expect(schema.properties).toHaveProperty('senderPublicKey');
     expect(schema.properties).toHaveProperty('creatorPublicKey');
+  });
+
+  it('documents the memo byte limit on the transaction build body', () => {
+    const schema = buildPaymentTransactionJsonSchema as {
+      required?: string[];
+      properties: Record<string, { type?: string; description?: string }>;
+    };
+    expect(schema.properties.memo.type).toBe('string');
+    expect(schema.properties.memo.description).toContain(`${MEMO_MAX_LENGTH} bytes`);
+    expect(schema.required ?? []).not.toContain('memo');
   });
 });

@@ -8,10 +8,18 @@ vi.mock('../../lib/queue', () => ({ stellarConfirmationQueue: { add: vi.fn() } }
 vi.mock('../../lib/stellar/wallet', () => ({
   getWalletBalance: vi.fn(),
 }));
+// The Stellar network is never reached from these tests: the transaction
+// helpers are stubbed so memo tests can assert whether a build was attempted.
+vi.mock('../../lib/stellar/transactions', () => ({
+  buildPaymentTransaction: vi.fn(),
+  submitSignedTransaction: vi.fn(),
+}));
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { PaymentService } from './payment.service';
 import { ValidationError, NotFoundError, PaymentDeclinedError, PaymentNotFoundError } from '../../utils/errors';
 import { getWalletBalance } from '../../lib/stellar/wallet';
+import { buildPaymentTransaction as buildStellarTransaction } from '../../lib/stellar/transactions';
+import { MEMO_MAX_LENGTH, buildTipMemo } from '../../lib/stellar/validation';
 
 const mockGetWalletBalance = getWalletBalance as ReturnType<typeof vi.fn>;
 
@@ -491,6 +499,67 @@ describe('PaymentService', () => {
 
       expect(result.items).toHaveLength(1);
       expect(result.pageInfo).toBeDefined();
+    });
+  });
+
+  describe('buildPaymentTransaction memo validation (#180)', () => {
+    const tipId = 'tip-123';
+    const senderPublicKey = 'GSENDER';
+    const creatorPublicKey = 'GCREATOR';
+
+    const build = (memo?: string) =>
+      paymentService.buildPaymentTransaction(
+        tipId,
+        senderPublicKey,
+        creatorPublicKey,
+        '10',
+        undefined,
+        undefined,
+        memo
+      );
+
+    beforeEach(() => {
+      mockPrisma.tip.findUnique.mockResolvedValue({
+        id: tipId,
+        fromUserId: 'user-123',
+        status: 'pending',
+      });
+      mockPrisma.wallet.findFirst.mockResolvedValue({ id: 'wallet-123', userId: 'user-123' });
+      vi.mocked(buildStellarTransaction).mockResolvedValue({ toXDR: () => 'AAAA-envelope' });
+    });
+
+    it('passes a 28 byte memo through to the Stellar builder', async () => {
+      const memo = 'a'.repeat(MEMO_MAX_LENGTH);
+
+      const result = await build(memo);
+
+      expect(result.transactionEnvelope).toBe('AAAA-envelope');
+      expect(buildStellarTransaction).toHaveBeenCalledWith(expect.objectContaining({ memo }));
+    });
+
+    it('derives the memo from the tip id when none is supplied', async () => {
+      await build();
+
+      expect(buildStellarTransaction).toHaveBeenCalledWith(
+        expect.objectContaining({ memo: buildTipMemo(tipId) })
+      );
+    });
+
+    it('rejects a 29 byte memo without attempting to build the transaction', async () => {
+      await expect(build('a'.repeat(MEMO_MAX_LENGTH + 1))).rejects.toThrow(ValidationError);
+
+      expect(buildStellarTransaction).not.toHaveBeenCalled();
+      expect(mockPrisma.tip.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('rejects a multibyte memo that fits in characters but not in bytes', async () => {
+      // 15 two byte characters: 15 characters, 30 bytes.
+      const error = await build('é'.repeat(15)).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ValidationError);
+      expect((error as ValidationError).message).toContain(`${MEMO_MAX_LENGTH} UTF-8 bytes`);
+      expect((error as ValidationError).details).toEqual({ field: 'memo' });
+      expect(buildStellarTransaction).not.toHaveBeenCalled();
     });
   });
 

@@ -73,7 +73,7 @@ export function validateMemo(memo: unknown): MemoValidationResult {
     return {
       valid: false,
       length,
-      reason: `Memo must be at most ${MEMO_MAX_LENGTH} characters`,
+      reason: `Memo must be at most ${MEMO_MAX_LENGTH} UTF-8 bytes (got ${length})`,
     };
   }
 

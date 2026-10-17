@@ -2,6 +2,7 @@ import * as StellarSdk from '@stellar/stellar-sdk';
 import { getStellarClient } from './client';
 import { logger } from '../../utils/logger';
 import { CircuitBreakerOpenError } from '../circuit-breaker';
+import { MEMO_MAX_LENGTH } from './validation';
 
 export interface PaymentTransactionData {
   senderPublicKey: string;
@@ -102,10 +103,11 @@ export async function buildPaymentTransaction(data: PaymentTransactionData): Pro
       logger.debug(`Added payment operation: ${data.amount} XLM (native)`);
     }
 
-    // Add memo if provided (typically tip ID or reference)
+    // Add memo if provided (typically tip ID or reference). Stellar caps a text
+    // memo at MEMO_MAX_LENGTH bytes, so count UTF-8 bytes rather than characters.
     if (data.memo) {
-      if (data.memo.length > 28) {
-        throw new Error('Memo text must be 28 characters or less');
+      if (Buffer.byteLength(data.memo, 'utf8') > MEMO_MAX_LENGTH) {
+        throw new Error(`Memo text must be ${MEMO_MAX_LENGTH} bytes or less`);
       }
       builder = builder.addMemo(StellarSdk.Memo.text(data.memo));
       logger.debug(`Added memo: ${data.memo}`);

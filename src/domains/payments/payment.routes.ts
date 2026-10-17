@@ -288,7 +288,9 @@ export const registerPaymentRoutes = (app: FastifyInstance, prisma: PrismaClient
    * POST /api/v1/transactions/:id/build
    * Build a Stellar payment transaction for frontend signing
    * Requires: authenticated user
-   * Body: { senderPublicKey, creatorPublicKey, amount, assetCode?, assetIssuer? }
+   * Body: { senderPublicKey, creatorPublicKey, amount, assetCode?, assetIssuer?, memo? }
+   * An optional memo is limited to 28 UTF-8 bytes and rejected with a 400
+   * field error before the transaction is built (#180).
    */
   app.post<{ Params: { id: string }; Body: BuildPaymentTransactionInput }>(
     '/api/v1/transactions/:id/build',
@@ -308,7 +310,8 @@ export const registerPaymentRoutes = (app: FastifyInstance, prisma: PrismaClient
         throw new UnauthorizedError('Authentication required');
       }
 
-      const { senderPublicKey, creatorPublicKey, amount, assetCode, assetIssuer } = request.body;
+      const { senderPublicKey, creatorPublicKey, amount, assetCode, assetIssuer, memo } =
+        request.body;
 
       const result = await paymentService.buildPaymentTransaction(
         request.params.id,
@@ -316,7 +319,8 @@ export const registerPaymentRoutes = (app: FastifyInstance, prisma: PrismaClient
         creatorPublicKey,
         amount,
         assetCode,
-        assetIssuer || process.env.USDC_ISSUER
+        assetIssuer || process.env.USDC_ISSUER,
+        memo
       );
 
       reply.code(200).send(formatSuccess(result));

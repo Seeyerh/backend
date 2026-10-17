@@ -3,8 +3,10 @@ import { sanitizeString } from '../../middleware/validation';
 import {
   ASSET_CODE_MAX_LENGTH,
   MAX_PAYMENT_AMOUNT,
+  MEMO_MAX_LENGTH,
   isValidAssetCode,
   isValidStellarPublicKey,
+  validateMemo,
 } from '../../lib/stellar/validation';
 import { zodToJsonSchema } from '../../utils/zod-to-json-schema';
 import { TIP_TEXT_SEARCH_MAX_LENGTH } from './tip-filters';
@@ -27,6 +29,30 @@ export const StellarPublicKeySchema = z
   .string()
   .trim()
   .refine(isValidStellarPublicKey, { message: 'Invalid Stellar public key' });
+
+/**
+ * Text memo attached to a Stellar payment transaction (#180).
+ *
+ * The protocol caps MEMO_TEXT at MEMO_MAX_LENGTH (28) bytes, counted after
+ * UTF-8 encoding: 28 ASCII characters fit, 15 two byte characters do not. The
+ * check reuses `validateMemo` and runs with the rest of the request validation,
+ * so an oversized memo is answered with a 400 field error naming the byte limit
+ * before any transaction is built.
+ */
+export const MemoSchema = z
+  .string()
+  .trim()
+  .min(1, 'Memo cannot be empty')
+  .superRefine((value, ctx) => {
+    const check = validateMemo(value);
+    if (!check.valid) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: check.reason ?? `Memo must be at most ${MEMO_MAX_LENGTH} UTF-8 bytes`,
+      });
+    }
+  })
+  .describe(`Stellar text memo, at most ${MEMO_MAX_LENGTH} bytes when encoded as UTF-8`);
 
 /** Text fields are sanitized (control chars/tags removed) before length checks. */
 const sanitizedText = (maxLength: number, label: string) =>
@@ -135,6 +161,12 @@ export const BuildPaymentTransactionSchema = z.object({
     .refine(isValidAssetCode, 'Invalid asset code')
     .optional(),
   assetIssuer: StellarPublicKeySchema.optional(),
+  /**
+   * Optional text memo for the on-chain payment, limited to MEMO_MAX_LENGTH
+   * (28) UTF-8 bytes (see `MemoSchema`). When omitted the service derives the
+   * memo from the tip id.
+   */
+  memo: MemoSchema.optional(),
 });
 
 /**
